@@ -592,3 +592,30 @@ register_kernel(
         ),
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.nomas_qk_norm_mrope",
+        backend=KernelBackend.KDA,
+        target="sglang.kernels.kda_kernels.nomas_qk_norm_mrope:nomas_qk_norm_mrope",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+def nomas_qk_norm_mrope(
+    x: torch.Tensor,
+    mean_t: torch.Tensor,
+    mean_hw: torch.Tensor,
+    weight_t: torch.Tensor,
+    weight_hw: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Split QK norm + (64,32,32) MRoPE, retaining caller-computed means."""
+    return get_kernel("attention.nomas_qk_norm_mrope", KernelBackend.KDA)(
+        x, mean_t, mean_hw, weight_t, weight_hw, cos, sin, eps, out
+    )

@@ -20,6 +20,7 @@ from msgspec import Struct
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.ops.attention import nomas_qk_norm_mrope
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_group_coordinator,
@@ -319,6 +320,18 @@ class GenAttention(nn.Module):
     def _prepare_qk_fused(self, x, cos, sin, norm_t, norm_hw, dtype):
         """Same values as the eager path: ATen mean squares, one fused kernel for the rest."""
         half = x.shape[-1] // 2
+        direct = (
+            x.is_cuda
+            and torch.version.hip is None
+            and x.stride(-1) == 1
+            and cos.shape == sin.shape == (1, x.shape[1], 1, 128)
+            and cos.stride(-1) == sin.stride(-1) == 1
+            and x.dtype == dtype == torch.bfloat16
+            and x.shape[-1] == 128
+            and self.arch.rope_sections == (64, 32, 32)
+            and cos.dtype == sin.dtype == torch.float32
+            and norm_t.weight.dtype == norm_hw.weight.dtype == torch.bfloat16
+        )
         result = torch.empty_like(x, dtype=dtype)
         # Only the FP32 squares are materialised now, so far larger chunks fit.
         chunk = max(
@@ -326,10 +339,27 @@ class GenAttention(nn.Module):
         )
         for first in range(0, x.shape[1], chunk):
             part = x[:, first : first + chunk]
+            mean_t = _mean_square(part[..., :half])
+            mean_hw = _mean_square(part[..., half:])
+            if direct:
+                # Preserve ATen's reductions and write the fused result straight
+                # into its final chunk, avoiding a temporary and slice copy.
+                nomas_qk_norm_mrope(
+                    part,
+                    mean_t,
+                    mean_hw,
+                    norm_t.weight,
+                    norm_hw.weight,
+                    cos[:, first : first + chunk],
+                    sin[:, first : first + chunk],
+                    norm_t.eps,
+                    out=result[:, first : first + chunk],
+                )
+                continue
             result[:, first : first + chunk] = _compiled_qk_norm_mrope()(
                 part,
-                _mean_square(part[..., :half]),
-                _mean_square(part[..., half:]),
+                mean_t,
+                mean_hw,
                 norm_t.eps,
                 norm_t.weight,
                 norm_hw.weight,
